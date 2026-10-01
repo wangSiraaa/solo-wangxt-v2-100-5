@@ -6,9 +6,10 @@ interface Props {
   names: string[];
   value: Record<string, VariableDef>;
   onChange: (next: Record<string, VariableDef>) => void;
+  readOnly?: boolean;
 }
 
-export default function VariableTable({ names, value, onChange }: Props) {
+export default function VariableTable({ names, value, onChange, readOnly = false }: Props) {
   // 用户曾经定义、但当前公式里已不存在的变量也暂时保留（切换公式文本时不丢输入）
   const extra = Object.keys(value).filter((k) => !names.includes(k));
   const rows = [...names, ...extra];
@@ -38,6 +39,7 @@ export default function VariableTable({ names, value, onChange }: Props) {
               inputMode="decimal"
               placeholder="如 9.81"
               value={def.value}
+              disabled={readOnly}
               onChange={(e) => set(name, { value: e.target.value })}
             />
             <input
@@ -45,9 +47,10 @@ export default function VariableTable({ names, value, onChange }: Props) {
               list="unit-suggestions"
               placeholder="如 m/s^2"
               value={def.unit}
+              disabled={readOnly}
               onChange={(e) => set(name, { unit: e.target.value })}
             />
-            {ghost && (
+            {ghost && !readOnly && (
               <button
                 type="button"
                 className="mini-btn"
@@ -67,4 +70,3 @@ export default function VariableTable({ names, value, onChange }: Props) {
     </div>
   );
 }
-

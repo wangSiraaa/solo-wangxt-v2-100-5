@@ -7,7 +7,7 @@
 - **MathLive** 提供所见即所得的数学输入（`+ − × ÷`、幂、分数、括号、希腊字母/下标）
 - **KaTeX** 渲染原式与代入后的计算式（问题节点红/橙色高亮）
 - **mathjs** 负责表达式解析、单位量纲与常用单位换算
-- **IndexedDB** 自动保存，支持 JSON 导出/导入（导出保留可再次编辑的 LaTeX 表达式）
+- **IndexedDB** 自动保存；自由公式、任务包版本、学生尝试和冻结证据分库存储，支持 JSON 导出/导入与离线重放
 
 ## 启动
 
@@ -15,8 +15,8 @@
 npm install
 npm run dev       # 本地开发
 npm run build     # 类型检查 + 生产构建到 dist/
-npm test          # 36 个单元测试（引擎 + 导出导入）
-node e2e/smoke.mjs # 25 项真实浏览器端到端检查（需先 npm run dev）
+npm test          # 50 个单元测试（引擎 + 任务包 + JSON 证据）
+node e2e/smoke.mjs # 25 项真实浏览器端到端检查（需先 npm run dev -- --port 5199）
 ```
 
 ## 首版明确支持的范围
@@ -39,6 +39,20 @@ node e2e/smoke.mjs # 25 项真实浏览器端到端检查（需先 npm run dev�
 7. **公式隔离**：每条公式独立分析、独立持久化，一条公式的任何错误都不会影响其他公式。
 8. **三段展示**：原式 → 替换变量后的计算式 → 结果（含结果单位及可选的目标单位换算值）。导出的 JSON 同时保存 LaTeX（可编辑本体）与中缀表达式（便于备份查看）。
 
+## 实验任务包与证据流
+
+界面分为「自由公式 / 教师任务 / 学生尝试 / 提交证据」四部分：
+
+1. **教师草稿与发布版本**：草稿可反复编辑公式、必填变量、目标单位、期望值和容差；发布时计算内容哈希并冻结为 `packageId@version`。修改发布内容只能通过「修订」派生新版本，旧版本继续保留。
+2. **学生导入与尝试**：发布包 JSON 导入后按 `versionId` 生成稳定尝试 ID。重复导入同一包只复用原尝试，不复制记录；新版本是独立任务，必须重新作答。
+3. **提交冻结**：提交先把 pending 记录（含由尝试 ID、版本 ID、规范化答案计算出的提交 ID）写入 IndexedDB，再生成不可变证据。页面在该窗口刷新后会用同一提交 ID 恢复，不制造重复尝试；相同答案重复提交也复用原证据。
+4. **完整历史**：错误答案保留失败证据；学生修正后再次提交会新增一条记录，而不是覆盖失败历史。证据内嵌公式规格、变量、分析结果、量纲问题、任务版本、内容哈希和引擎版本。
+5. **通过条件**：引擎 `error`（量纲错误、未定义变量、除零、语法错误等）和 `unverified`（摄氏读数直接运算、未支持表达式等）均不能通过；目标单位换算失败或不符合期望值/容差也拒绝。任务内每条公式独立求值和持久化，一条失败不会阻断其他检查的诊断。
+6. **离线重放**：证据 JSON 可单独导出/归档；证据视图使用快照中的旧公式和旧变量重新求值，并显示当前引擎结果是否与冻结快照一致。
+
+发布任务包和证据 JSON 均带 `kind` 与版本字段；导入时会重新计算任务内容哈希，篡改公式或通过条件会被拒绝。
+
+
 ## 项目结构
 
 ```
@@ -49,14 +63,20 @@ src/
     units.ts        # 首版常用单位清单（输入提示）
     types.ts        # Formula / AnalysisResult / Issue 类型
     math.test.ts    # 引擎测试（摄氏、角度、除零、定位、隔离…）
+    task.ts         # 任务版本、发布哈希、独立检查、提交冻结、证据重放
+    task.test.ts    # 任务/版本/幂等提交测试
   storage/
-    db.ts           # IndexedDB 封装
-    exchange.ts     # JSON 导出/导入
+    db.ts           # IndexedDB：公式、任务包、尝试三个对象库
+    exchange.ts     # 笔记、发布任务包、冻结证据 JSON
+    task-exchange.test.ts
   components/
     MathInput.tsx   # MathLive math-field 封装
     Tex.tsx         # KaTeX 渲染
     VariableTable.tsx
     FormulaCard.tsx # 单条公式：输入/赋值/三段展示/问题定位
+    TeacherStudio.tsx
+    StudentWorkspace.tsx
+    EvidenceView.tsx
     UnitSuggestions.tsx
   App.tsx  main.tsx  styles.css
 e2e/smoke.mjs       # Playwright 端到端冒烟

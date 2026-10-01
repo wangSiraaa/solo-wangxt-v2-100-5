@@ -1,8 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Formula } from "./engine/types";
-import { db, newId } from "./storage/db";
-import { buildExport, downloadJSON, parseImport } from "./storage/exchange";
 import FormulaCard from "./components/FormulaCard";
+import StudentWorkspace from "./components/StudentWorkspace";
+import TeacherStudio from "./components/TeacherStudio";
+import EvidenceView from "./components/EvidenceView";
+import type { Formula, TaskAttempt, TaskPackage } from "./engine/types";
+import { completeSubmission, createAttempt } from "./engine/task";
+import { db, newId } from "./storage/db";
+import {
+  buildExport,
+  detectImport,
+  downloadJSON,
+  mergeEvidence,
+  parseImport,
+} from "./storage/exchange";
+
+type Tab = "notebook" | "teacher" | "student" | "evidence";
 
 function makeFormula(partial?: Partial<Formula>): Formula {
   return {
@@ -17,20 +29,27 @@ function makeFormula(partial?: Partial<Formula>): Formula {
 }
 
 export default function App() {
+  const [tab, setTab] = useState<Tab>("notebook");
   const [formulas, setFormulas] = useState<Formula[]>([]);
+  const [tasks, setTasks] = useState<TaskPackage[]>([]);
+  const [attempts, setAttempts] = useState<TaskAttempt[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [notice, setNotice] = useState<string>("");
-  const fileRef = useRef<HTMLInputElement>(null);
+  const notebookFileRef = useRef<HTMLInputElement>(null);
+  const studentFileRef = useRef<HTMLInputElement>(null);
 
-  // 启动时读取 IndexedDB
   useEffect(() => {
-    db.all()
-      .then((rows) => setFormulas(rows))
+    Promise.all([db.all(), db.allTasks(), db.allAttempts()])
+      .then(([rows, taskRows, attemptRows]) => {
+        setFormulas(rows);
+        setTasks(taskRows);
+        setAttempts(attemptRows);
+      })
       .catch((e) => setNotice(`读取本地存储失败：${(e as Error).message}`))
       .finally(() => setLoaded(true));
   }, []);
 
-  // 变更防抖写入（每条公式独立持久化，互不影响）
+  // 自由笔记变更防抖写入。任务/提交为关键证据，采用显式 await 写入而非防抖。
   const saveTimer = useRef<number | undefined>(undefined);
   useEffect(() => {
     if (!loaded) return;
@@ -39,6 +58,28 @@ export default function App() {
       db.bulkPut(formulas).catch((e) => setNotice(`保存失败：${(e as Error).message}`));
     }, 300);
   }, [formulas, loaded]);
+
+  // 恢复“提交冻结已经开始、但页面在完成前刷新”的提交。
+  const recoveredRef = useRef(false);
+  useEffect(() => {
+    if (!loaded || recoveredRef.current) return;
+    recoveredRef.current = true;
+    const pending = attempts.filter((a) => a.pendingSubmission);
+    if (pending.length === 0) return;
+    const byVersion = new Map(tasks.map((t) => [t.versionId, t]));
+    const next = attempts.map((attempt) => {
+      const p = attempt.pendingSubmission;
+      const task = byVersion.get(attempt.versionId);
+      if (!p) return attempt;
+      if (!task) {
+        return { ...attempt, pendingSubmission: null, updatedAt: Date.now() };
+      }
+      return completeSubmission(task, attempt, p).attempt;
+    });
+    setAttempts(next);
+    void Promise.all(next.map((a) => db.putAttempt(a)));
+    setNotice(`已恢复 ${pending.length} 条刷新中中断的提交；仍使用原幂等提交 ID`);
+  }, [loaded, attempts, tasks]);
 
   const update = useCallback((id: string, patch: Partial<Formula>) => {
     setFormulas((fs) => fs.map((f) => (f.id === id ? { ...f, ...patch } : f)));
@@ -104,12 +145,12 @@ export default function App() {
     setFormulas((fs) => [...fs, presets[kind]]);
   };
 
-  const onExport = () => {
+  const onExportNotebook = () => {
     if (formulas.length === 0) { setNotice("当前没有可导出的公式"); return; }
     downloadJSON(buildExport(formulas));
   };
 
-  const onImportFile = async (file: File) => {
+  const onNotebookFile = async (file: File) => {
     const text = await file.text();
     const { formulas: imported, errors } = parseImport(text, new Set(formulas.map((f) => f.id)));
     if (imported.length === 0) {
@@ -120,32 +161,118 @@ export default function App() {
     setNotice(`已导入 ${imported.length} 条公式${errors.length ? `；${errors.length} 条被跳过（${errors[0]}）` : ""}`);
   };
 
+  const saveDraft = useCallback(async (task: TaskPackage, oldId?: string) => {
+    setTasks((rows) => {
+      const withoutOld = rows.filter((t) => t.id !== task.id && t.id !== oldId);
+      return [...withoutOld, task];
+    });
+    await db.putTask(task);
+    if (oldId && oldId !== task.id) await db.deleteTask(oldId);
+  }, []);
+
+  const deleteTask = useCallback(async (id: string) => {
+    setTasks((rows) => rows.filter((t) => t.id !== id));
+    await db.deleteTask(id);
+  }, []);
+
+  const upsertAttempt = useCallback(async (attempt: TaskAttempt) => {
+    setAttempts((rows) => {
+      const exists = rows.some((a) => a.id === attempt.id);
+      return exists ? rows.map((a) => (a.id === attempt.id ? attempt : a)) : [...rows, attempt];
+    });
+    await db.putAttempt(attempt);
+  }, []);
+
+  const onStudentFile = async (file: File) => {
+    const text = await file.text();
+    const detected = detectImport(text, new Set(formulas.map((f) => f.id)));
+    if (detected.type === "notebook") {
+      setNotice("这是普通笔记 JSON；请在“自由笔记”页导入");
+      return;
+    }
+    if (detected.type === "unknown") {
+      setNotice(detected.errors.join("；"));
+      return;
+    }
+    if (detected.type === "task") {
+      if (detected.errors.length) {
+        setNotice(`任务包被拒绝：${detected.errors.join("；")}`);
+        return;
+      }
+      const task = detected.task;
+      const existed = tasks.some((t) => t.id === task.id);
+      setTasks((rows) => (rows.some((t) => t.id === task.id) ? rows : [...rows, task]));
+      await db.putTask(task);
+      let attempt = attempts.find((a) => a.versionId === task.versionId);
+      if (!attempt) {
+        attempt = createAttempt(task);
+        setAttempts((rows) => [...rows, attempt!]);
+        await db.putAttempt(attempt);
+      }
+      setTab("student");
+      setNotice(existed
+        ? `任务包 ${task.versionId} 已存在：复用同一尝试，不创建重复记录`
+        : `已导入发布任务 ${task.title} v${task.version}，并生成幂等尝试 ${attempt.id}`);
+      return;
+    }
+    const existing = attempts.find((a) => a.id === detected.submission.attemptId);
+    const merged = mergeEvidence(existing, detected.submission);
+    await upsertAttempt(merged);
+    setTab("evidence");
+    setNotice(existing
+      ? "证据文件已归档；相同提交 ID 未重复添加"
+      : "已导入离线提交证据，并按冻结版本创建证据档案");
+  };
+
   return (
     <div className="app">
       <header className="topbar">
-        <h1>量纲检查笔记本</h1>
+        <h1>量纲检查笔记本 · 实验任务包</h1>
         <p className="subtitle">
-          本地运行 · 数据仅保存在本浏览器（IndexedDB）· 首版支持 + − × ÷、幂与常用单位换算
+          本地运行 · IndexedDB 离线留痕 · 发布版本冻结 · 提交证据可重放
         </p>
+        <nav className="tabs" aria-label="主要视图">
+          <button type="button" className={tab === "notebook" ? "active" : ""} onClick={() => setTab("notebook")}>自由公式</button>
+          <button type="button" className={tab === "teacher" ? "active" : ""} onClick={() => setTab("teacher")}>教师任务</button>
+          <button type="button" className={tab === "student" ? "active" : ""} onClick={() => setTab("student")}>学生尝试</button>
+          <button type="button" className={tab === "evidence" ? "active" : ""} onClick={() => setTab("evidence")}>提交证据</button>
+        </nav>
         <div className="actions">
-          <button type="button" onClick={add}>＋ 新建公式</button>
-          <span className="sep" />
-          <button type="button" className="ghost" onClick={() => addExample("unit")}>示例：单位运算</button>
-          <button type="button" className="ghost" onClick={() => addExample("degC")}>示例：摄氏温标</button>
-          <button type="button" className="ghost" onClick={() => addExample("angle")}>示例：角度弧度</button>
-          <button type="button" className="ghost" onClick={() => addExample("dimErr")}>示例：量纲错误</button>
-          <button type="button" className="ghost" onClick={() => addExample("divZero")}>示例：除零</button>
-          <span className="sep" />
-          <button type="button" className="ghost" onClick={onExport}>导出 JSON</button>
-          <button type="button" className="ghost" onClick={() => fileRef.current?.click()}>导入 JSON</button>
+          {tab === "notebook" && <>
+            <button type="button" onClick={add}>＋ 新建公式</button>
+            <span className="sep" />
+            <button type="button" className="ghost" onClick={() => addExample("unit")}>示例：单位运算</button>
+            <button type="button" className="ghost" onClick={() => addExample("degC")}>示例：摄氏温标</button>
+            <button type="button" className="ghost" onClick={() => addExample("angle")}>示例：角度弧度</button>
+            <button type="button" className="ghost" onClick={() => addExample("dimErr")}>示例：量纲错误</button>
+            <button type="button" className="ghost" onClick={() => addExample("divZero")}>示例：除零</button>
+            <span className="sep" />
+            <button type="button" className="ghost" onClick={onExportNotebook}>导出笔记 JSON</button>
+            <button type="button" className="ghost" onClick={() => notebookFileRef.current?.click()}>导入笔记 JSON</button>
+          </>}
+          {tab === "student" && <>
+            <button type="button" className="primary" onClick={() => studentFileRef.current?.click()}>导入发布任务 / 证据 JSON</button>
+            <span className="muted small">重复导入同一版本会复用原尝试</span>
+          </>}
           <input
-            ref={fileRef}
+            ref={notebookFileRef}
             type="file"
             accept="application/json,.json"
             style={{ display: "none" }}
             onChange={(e) => {
               const f = e.target.files?.[0];
-              if (f) void onImportFile(f);
+              if (f) void onNotebookFile(f);
+              e.target.value = "";
+            }}
+          />
+          <input
+            ref={studentFileRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void onStudentFile(f);
               e.target.value = "";
             }}
           />
@@ -155,17 +282,16 @@ export default function App() {
 
       <main>
         {!loaded ? (
-          <p className="muted">正在加载本地笔记…</p>
-        ) : formulas.length === 0 ? (
-          <div className="empty-state">
-            <p>还没有公式。点击「新建公式」或加载一个示例开始。</p>
-            <p className="muted small">
-              规则：未赋值变量与除零都会明确报错（不会自动取零）；
-              摄氏/华氏温标的四则运算、未列出的函数等会标记为「未验证」，需要人工确认。
-            </p>
-          </div>
-        ) : (
-          formulas.map((f, i) => (
+          <p className="muted">正在加载本地数据…</p>
+        ) : tab === "notebook" ? (
+          formulas.length === 0 ? (
+            <div className="empty-state">
+              <p>还没有公式。点击「新建公式」或加载一个示例开始。</p>
+              <p className="muted small">
+                规则：未赋值变量与除零都会明确报错；摄氏/华氏温标的四则运算、未列出的函数等会标记为「未验证」。
+              </p>
+            </div>
+          ) : formulas.map((f, i) => (
             <FormulaCard
               key={f.id}
               formula={f}
@@ -174,13 +300,18 @@ export default function App() {
               onDelete={() => void remove(f.id)}
             />
           ))
+        ) : tab === "teacher" ? (
+          <TeacherStudio tasks={tasks} onSaveDraft={saveDraft} onDelete={deleteTask} onNotice={setNotice} />
+        ) : tab === "student" ? (
+          <StudentWorkspace tasks={tasks} attempts={attempts} onUpsertAttempt={upsertAttempt} onNotice={setNotice} />
+        ) : (
+          <EvidenceView attempts={attempts} tasks={tasks} />
         )}
       </main>
 
       <footer className="footer">
         <p>
-          红色 = 明确错误（量纲不兼容、未赋值、除零、语法错误）；橙色 = 超出首版支持范围，结果未验证。
-          公式之间完全独立，一条出错不会影响其他公式。
+          红色 = 明确错误；橙色 = 未验证。任务内公式独立判定；提交快照冻结公式、变量、结果、量纲问题、任务版本和引擎版本。
         </p>
       </footer>
     </div>

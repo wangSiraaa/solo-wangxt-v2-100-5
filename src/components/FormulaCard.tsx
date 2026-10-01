@@ -10,7 +10,11 @@ interface Props {
   formula: Formula;
   index: number;
   onChange: (patch: Partial<Formula>) => void;
-  onDelete: () => void;
+  onDelete?: () => void;
+  readOnly?: boolean;
+  editableVariables?: boolean;
+  variableNames?: string[];
+  defaultCollapsed?: boolean;
 }
 
 const STATUS_META = {
@@ -20,8 +24,8 @@ const STATUS_META = {
   empty: { label: "空公式", cls: "empty" },
 } as const;
 
-export default function FormulaCard({ formula, index, onChange, onDelete }: Props) {
-  const [collapsed, setCollapsed] = useState(false);
+export default function FormulaCard({ formula, index, onChange, onDelete, readOnly = false, editableVariables = !readOnly, variableNames, defaultCollapsed = false }: Props) {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
   const result = useMemo(
     () => analyzeFormula(formula.latex, formula.variables, formula.targetUnit),
     [formula.latex, formula.variables, formula.targetUnit],
@@ -39,9 +43,12 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
         <strong>公式 {index + 1}</strong>
         <span className={`badge ${meta.cls}`}>{meta.label}</span>
         <span className="summary">{result.summary}</span>
-        <button type="button" className="mini-btn danger" onClick={onDelete} title="删除此公式（不影响其他公式）">
-          删除
-        </button>
+        {readOnly && <span className="lock-tag">发布快照只读</span>}
+        {onDelete && (
+          <button type="button" className="mini-btn danger" onClick={onDelete} title="删除此公式（不影响其他公式）">
+            删除
+          </button>
+        )}
       </header>
 
       {!collapsed && (
@@ -52,13 +59,19 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
               value={formula.latex}
               onChange={(latex) => onChange({ latex })}
               placeholder="例如  v \\cdot t + \\frac{1}{2} a t^2"
+              readOnly={readOnly}
             />
           </label>
 
           <div className="grid-2">
             <div>
               <div className="field-label">变量赋值</div>
-              <VariableTable names={result.variables} value={formula.variables} onChange={setVars} />
+              <VariableTable
+                names={variableNames ?? result.variables}
+                value={formula.variables}
+                onChange={setVars}
+                readOnly={!editableVariables}
+              />
             </div>
             <div>
               <label className="field-label">
@@ -69,6 +82,7 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
                   value={formula.targetUnit}
                   placeholder="自动（保留计算单位）"
                   onChange={(e) => onChange({ targetUnit: e.target.value })}
+                  readOnly={readOnly}
                 />
               </label>
               <label className="field-label">
@@ -77,6 +91,7 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
                   value={formula.note}
                   placeholder="例如：自由落体位移"
                   onChange={(e) => onChange({ note: e.target.value })}
+                  readOnly={readOnly}
                 />
               </label>
             </div>
@@ -152,7 +167,6 @@ export default function FormulaCard({ formula, index, onChange, onDelete }: Prop
 function fmt(n: number | undefined): string {
   if (n === undefined) return "";
   if (!Number.isFinite(n)) return String(n);
-  // 截断浮点尾零，科学计数法用 TeX 指数
   const abs = Math.abs(n);
   if (abs !== 0 && (abs >= 1e7 || abs < 1e-4)) {
     const [m, e] = n.toExponential(6).split("e");
