@@ -408,6 +408,48 @@ function highlightTex(root: AnyNode, issues: Issue[]): string {
   return root.toTex({ handler: handler as never });
 }
 
+// ---------- 结构探查（不赋变量值）：教师编辑任务、发布校验使用 ----------
+
+export interface FormulaInspection {
+  /** 公式是否为空 */
+  empty: boolean;
+  /** LaTeX 转换 / 语法解析是否结构性合法（与变量是否赋值无关） */
+  structurallyValid: boolean;
+  /** 结构问题描述（转换失败或语法错误） */
+  structuralError?: string;
+  source?: string;
+  /** 识别出的用户变量名 */
+  variables: string[];
+}
+
+/** 只做 LaTeX 转换 + 语法解析 + 变量收集，不做求值（教师任务编辑使用） */
+export function inspectFormula(latex: string): FormulaInspection {
+  if (!latex.trim()) return { empty: true, structurallyValid: false, variables: [] };
+  let source: string;
+  try {
+    source = latexToSource(latex).source;
+  } catch (e) {
+    if (e instanceof LatexConvertError) {
+      return { empty: false, structurallyValid: false, structuralError: `公式输入无法转换：${e.message}`, variables: [] };
+    }
+    throw e;
+  }
+  let tree: AnyNode;
+  try {
+    tree = asAny(math.parse(source));
+  } catch (e) {
+    const err = e as Error & { char?: number };
+    return {
+      empty: false,
+      structurallyValid: false,
+      source,
+      structuralError: `数学表达式语法错误：${err.message}${typeof err.char === "number" ? `（位置 ${err.char}）` : ""}`,
+      variables: [],
+    };
+  }
+  return { empty: false, structurallyValid: true, source, variables: collectVariables(tree) };
+}
+
 // ---------- 入口 ----------
 
 export function analyzeFormula(
@@ -415,46 +457,29 @@ export function analyzeFormula(
   varDefs: Record<string, VariableDef>,
   targetUnitText: string,
 ): AnalysisResult {
-  if (!latex.trim()) {
+  // 0) 结构探查（LaTeX 转换 + 语法解析，与变量是否赋值无关）
+  const inspection = inspectFormula(latex);
+  if (inspection.empty) {
     return { status: "empty", variables: [], issues: [] };
   }
-
-  // 1) LaTeX → 中缀表达式
-  let source: string;
-  const convertNotices: string[] = [];
-  try {
-    const conv = latexToSource(latex);
-    source = conv.source;
-    convertNotices.push(...new Set(conv.notices));
-  } catch (e) {
-    if (e instanceof LatexConvertError) {
-      return {
-        status: "error",
-        variables: [],
-        issues: [{ kind: "error", path: [], snippet: latex, message: `公式输入无法转换：${e.message}` }],
-      };
-    }
-    throw e;
-  }
-
-  // 2) 数学语法解析
-  let tree: AnyNode;
-  try {
-    tree = asAny(math.parse(source));
-  } catch (e) {
-    const err = e as Error & { char?: number };
+  if (!inspection.structurallyValid) {
     return {
       status: "error",
       variables: [],
-      source,
-      issues: [{
-        kind: "error",
-        path: [],
-        snippet: source,
-        message: `数学表达式语法错误：${err.message}${typeof err.char === "number" ? `（位置 ${err.char}）` : ""}`,
-      }],
+      source: inspection.source,
+      issues: [{ kind: "error", path: [], snippet: inspection.source ?? latex, message: inspection.structuralError! }],
     };
   }
+  const source = inspection.source!;
+  let convertNotices: string[] = [];
+  try {
+    convertNotices = [...new Set(latexToSource(latex).notices)];
+  } catch {
+    // inspectFormula 已确认可转换，这里不会进入
+  }
+
+  // 结构探查已确认可解析
+  const tree: AnyNode = asAny(math.parse(source));
 
   // 给每个节点标记自身路径
   walk(tree, [], (n, p) => { (n as PathNode)[ORIG_PATH] = p; });
@@ -469,7 +494,7 @@ export function analyzeFormula(
     col.issues.push({ kind: "warning", path: [], snippet: tree.toTex(), message: notice });
   }
 
-  const variables = collectVariables(tree);
+  const variables = inspection.variables;
 
   // 4) 变量解析（同一变量多处引用：只在首次出现处报未定义）
   const scope = new Map<string, Quantity>();
